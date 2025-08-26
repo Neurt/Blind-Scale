@@ -1,10 +1,3 @@
-/*
-   -------------------------------------------------------------------------------------
-   HX711 Scale for Weighing People with ThingsBoard IoT Integration
-   Optimized for minimal power consumption
-   -------------------------------------------------------------------------------------
-*/
-
 #include <HX711_ADC.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
@@ -18,14 +11,14 @@
 #include <esp_bt.h>
 
 // WiFi credentials
-const char* WIFI_SSID = "";
-const char* WIFI_PASSWORD = "";
+const char* WIFI_SSID = "A55";
+const char* WIFI_PASSWORD = "blabla12";
 
 // ThingsBoard setup
 #define THINGSBOARD_SERVER  "demo.thingsboard.io" 
 #define THINGSBOARD_PORT    1883
 #define MQTT_CLIENT_ID      "scale_device" 
-#define THINGSBOARD_TOKEN   "your_device_token" 
+#define THINGSBOARD_TOKEN   "i4omoCgPlLDKNdQKjRmq" 
 
 // MQTT topics
 #define TELEMETRY_TOPIC     "v1/devices/me/telemetry"
@@ -42,6 +35,7 @@ unsigned long stableStartTime = 0;
 unsigned long weightRecordedTime = 0;
 unsigned long stepOffTime = 0;
 unsigned long wifiLastConnectTime = 0;
+unsigned long measurementStartTime = 0;  // Track when measurement started
 
 // Pins
 const uint8_t HX711_dout = 2;
@@ -70,6 +64,7 @@ const uint16_t WEIGHT_RESET_DELAY = 5000;
 const uint16_t AUTO_TARE_DELAY = 2000;
 const float AUTO_TARE_THRESHOLD = 10.0f;
 const uint8_t STABILITY_COUNT_THRESHOLD = 2;
+const uint16_t MEASUREMENT_TIMEOUT = 8000;  // Force output after 8 seconds if not stable
 
 // Battery constants
 const float BATTERY_DIVIDER_RATIO = 1.56f; 
@@ -196,7 +191,12 @@ void setup() {
     Serial.println("Unable to begin DFPlayer");
   } else {
     Serial.println("DFPlayer Mini online");
-    myDFPlayer.volume(27);
+    myDFPlayer.volume(29);
+    
+    // Play ready notification after tare is complete
+    delay(500); // Small delay to ensure DFPlayer is ready
+    myDFPlayer.play(001); 
+    delay(2000); // Wait for the audio to finish
   }
   
   // Load calibration factor
@@ -282,6 +282,14 @@ void loop() {
       state.bufferIndex = 0;
       
       displayMessage("Ready to weigh", "Step on scale");
+      
+      // Play auto-tare complete notification
+      if (!state.audioPlaying) {
+        state.audioPlaying = true;
+        myDFPlayer.play(001); 
+        delay(2000); // Wait for the audio to finish
+        state.audioPlaying = false;
+      }
     } else {
       displayMessage("Ready to weigh", "Step on scale");
     }
@@ -406,6 +414,12 @@ void handleSerialCommands() {
         state.lastDisplayedWeight = 0;
         state.bufferIndex = 0;
         displayMessage("Tare complete", "Step on scale", 1000);
+        
+        // Play tare complete notification
+        state.audioPlaying = true;
+        myDFPlayer.play(001); 
+        delay(2000); // Wait for the audio to finish
+        state.audioPlaying = false;
         break;
         
       case 'c':
@@ -558,6 +572,7 @@ void updateWeightMeasurement() {
     state.tareScheduled = false;
     state.stabilityCounter = 0;
     state.weightRecorded = false;
+    measurementStartTime = millis();  // Start timeout timer
     loadCell.setSamplesInUse(1);
     displayMessage("Measuring...");
   }
@@ -589,6 +604,15 @@ void updateWeightMeasurement() {
     stepOffTime = millis();
     state.tareScheduled = true;
     displayMessage("Processing...", "Please wait");
+    
+    // Play ready notification when person steps off (after a short delay)
+    delay(1000); // Wait a moment after stepping off
+    if (!state.audioPlaying) {
+      state.audioPlaying = true;
+      myDFPlayer.play(001); 
+      delay(2000); // Wait for the audio to finish
+      state.audioPlaying = false;
+    }
   }
   
   lastDisplayTime = millis();
@@ -616,8 +640,20 @@ void processWeightStability(float currentWeight) {
     state.lastStabilityState = isStable;
   }
   
-  // Record weight if stable long enough
+  // Record weight if stable long enough OR if timeout reached
+  bool shouldRecord = false;
+  bool timeoutReached = (millis() - measurementStartTime) > MEASUREMENT_TIMEOUT;
+  
   if (isStable && (millis() - stableStartTime) > STABLE_DURATION_REQUIRED) {
+    shouldRecord = true;
+    Serial.println("Weight recorded - STABLE reading");
+  } else if (timeoutReached && !state.weightRecorded) {
+    shouldRecord = true;
+    Serial.println("Weight recorded - TIMEOUT reached (may be unstable)");
+    displayMessage("Timeout reached", "Recording weight...", 1000);
+  }
+  
+  if (shouldRecord) {
     state.recordedWeight = roundToOneDecimal(calculateAverageWeight());
     state.weightRecorded = true;
     weightRecordedTime = millis();
@@ -647,11 +683,27 @@ void processWeightStability(float currentWeight) {
       displayMessage("Data sent!", "Weight recorded", 1500);
       // Return to showing the recorded weight
       displayRecordedWeight(state.recordedWeight);
+      
+      // Play ready notification after successful data transmission
+      if (!state.audioPlaying) {
+        state.audioPlaying = true;
+        myDFPlayer.play(001); 
+        delay(2000); // Wait for the audio to finish
+        state.audioPlaying = false;
+      }
     } else {
       // If WiFi connection fails, let the user know
       displayMessage("Failed to send", "No connection", 1500);
       // Return to showing the recorded weight
       displayRecordedWeight(state.recordedWeight);
+      
+      // Play ready notification even if WiFi failed
+      if (!state.audioPlaying) {
+        state.audioPlaying = true;
+        myDFPlayer.play(001); 
+        delay(2000); // Wait for the audio to finish
+        state.audioPlaying = false;
+      }
     }
   }
 }
