@@ -5,36 +5,14 @@
 #if defined(ESP8266)|| defined(ESP32) || defined(AVR)
 #include <EEPROM.h>
 #endif
-#include <WiFi.h>
-#include <PubSubClient.h>
-#include <esp_wifi.h>
 #include <esp_bt.h>
 
-// WiFi credentials
-const char* WIFI_SSID = "A55";
-const char* WIFI_PASSWORD = "blabla12";
-
-// ThingsBoard setup
-#define THINGSBOARD_SERVER  "demo.thingsboard.io" 
-#define THINGSBOARD_PORT    1883
-#define MQTT_CLIENT_ID      "scale_device" 
-#define THINGSBOARD_TOKEN   "i4omoCgPlLDKNdQKjRmq" 
-
-// MQTT topics
-#define TELEMETRY_TOPIC     "v1/devices/me/telemetry"
-
-// MQTT client
-WiFiClient espClient;
-PubSubClient mqttClient(espClient);
-
 // Timing variables
-unsigned long lastReconnectAttempt = 0;
 unsigned long lastDisplayTime = 0;
 unsigned long lastBatteryCheck = 0;
 unsigned long stableStartTime = 0;
 unsigned long weightRecordedTime = 0;
 unsigned long stepOffTime = 0;
-unsigned long wifiLastConnectTime = 0;
 unsigned long measurementStartTime = 0;  // Track when measurement started
 
 // Pins
@@ -75,7 +53,6 @@ const uint32_t BATTERY_CHECK_IDLE_INTERVAL = 120000; // In idle state, check eve
 const float LOW_BATTERY_THRESHOLD = 3.7f;
 
 // Power saving constants
-const uint32_t WIFI_DISCONNECT_TIMEOUT = 30000;    // Disconnect WiFi after 30s of inactivity
 const uint32_t SLEEP_TIMEOUT = 60000;              // Sleep display after 60s
 const uint32_t DEEP_SLEEP_TIMEOUT = 300000;        // Enter deep sleep after 5 minutes of inactivity
 const uint8_t HX711_IDLE_RATE = 10;                // Reduce sample rate when idle
@@ -96,7 +73,6 @@ struct ScaleState {
   bool newDataReady;
   bool isCharging;
   bool lowBatteryWarning;
-  bool wifiConnected;
   unsigned long lastLowBatteryAlert;  // New: timestamp of last low battery alert
   bool audioPlaying;                  // New: flag to track if audio is currently playing
 } state = {0};
@@ -120,9 +96,6 @@ inline float roundToOneDecimal(float value);
 void displayRecordedWeight(float weight);
 void playRecordedWeight(float recordedWeight);
 float checkBatteryAndCompensate(float weight);
-void setupWiFi();
-void reconnectMQTT();
-bool publishWeightToThingsBoard(float weight);
 void handleSerialCommands();
 void updateWeightMeasurement();
 void processWeightStability(float currentWeight);
@@ -131,16 +104,13 @@ void checkSleepMode();
 void wakeDisplay();
 void registerActivity();
 float getBatteryVoltage();
-void disableWiFi();
-void checkWiFiTimeout();
 void managePowerSaving();
 
 void setup() {
   // Set CPU frequency to save power
   setCpuFrequencyMhz(CPU_FREQ_MHZ);
   
-  // Disable WiFi and Bluetooth at startup to save power
-  WiFi.mode(WIFI_OFF);
+  // Disable Bluetooth at startup to save power
   btStop();
   
   Serial.begin(115200);
@@ -214,7 +184,7 @@ void setup() {
   
   loadCell.setCalFactor(calibrationFactor);
   
-  // Only check battery at start, don't connect to WiFi yet
+  // Only check battery at start
   checkBatteryAndCompensate(0);
   
   // Set to lower power sampling rate for idle state
@@ -225,7 +195,6 @@ void setup() {
   // Initialize activity timer and other state variables
   lastActivityTime = millis();
   displaySleeping = false;
-  state.wifiConnected = false;
   state.lastLowBatteryAlert = 0;
   state.audioPlaying = false;
 }
@@ -240,22 +209,6 @@ void loop() {
       registerActivity();
     }
   }
-  
-  // Only handle MQTT if WiFi is connected
-  if (state.wifiConnected) {
-    mqttClient.loop();
-    
-    if (!mqttClient.connected()) {
-      unsigned long now = millis();
-      if (now - lastReconnectAttempt > 5000) {
-        lastReconnectAttempt = now;
-        reconnectMQTT();
-      }
-    }
-  }
-  
-  // Manage WiFi state - disconnect when not needed
-  checkWiFiTimeout();
   
   // Handle serial commands
   handleSerialCommands();
@@ -344,7 +297,6 @@ void managePowerSaving() {
     
     // Prepare for deep sleep
     lcd.noBacklight();
-    disableWiFi();
     
     // Configure wake sources
     esp_sleep_enable_ext0_wakeup((gpio_num_t)HX711_dout, 0);
@@ -353,23 +305,6 @@ void managePowerSaving() {
     // Enter deep sleep
     esp_deep_sleep_start();
   }
-}
-
-void checkWiFiTimeout() {
-  // Disconnect WiFi if inactive to save power
-  if (state.wifiConnected && !state.personOnScale) {
-    if (millis() - wifiLastConnectTime > WIFI_DISCONNECT_TIMEOUT) {
-      Serial.println("WiFi idle timeout - disconnecting to save power");
-      disableWiFi();
-      state.wifiConnected = false;
-    }
-  }
-}
-
-void disableWiFi() {
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
-  esp_wifi_stop();
 }
 
 void checkSleepMode() {
@@ -666,45 +601,20 @@ void processWeightStability(float currentWeight) {
     // 2. Play the audio output immediately
     playRecordedWeight(state.recordedWeight);
     
-    // 3. Wait for a few seconds before connecting to WiFi
-    delay(3000); // 3 second delay
+    // 3. Show recorded weight and play ready notification
+    delay(1000); // Brief pause
+    displayMessage("Weight recorded", "Ready for next", 2000);
     
-    // 4. Now connect to WiFi if needed and publish to ThingsBoard
-    if (!state.wifiConnected) {
-      displayMessage("Connecting WiFi", "Please wait...");
-      setupWiFi();
+    // Play ready notification
+    if (!state.audioPlaying) {
+      state.audioPlaying = true;
+      myDFPlayer.play(001); 
+      delay(2000); // Wait for the audio to finish
+      state.audioPlaying = false;
     }
     
-    // 5. Publish to ThingsBoard
-    if (state.wifiConnected && publishWeightToThingsBoard(state.recordedWeight)) {
-      Serial.println("Weight published to ThingsBoard successfully");
-      wifiLastConnectTime = millis();
-      // Show confirmation briefly
-      displayMessage("Data sent!", "Weight recorded", 1500);
-      // Return to showing the recorded weight
-      displayRecordedWeight(state.recordedWeight);
-      
-      // Play ready notification after successful data transmission
-      if (!state.audioPlaying) {
-        state.audioPlaying = true;
-        myDFPlayer.play(001); 
-        delay(2000); // Wait for the audio to finish
-        state.audioPlaying = false;
-      }
-    } else {
-      // If WiFi connection fails, let the user know
-      displayMessage("Failed to send", "No connection", 1500);
-      // Return to showing the recorded weight
-      displayRecordedWeight(state.recordedWeight);
-      
-      // Play ready notification even if WiFi failed
-      if (!state.audioPlaying) {
-        state.audioPlaying = true;
-        myDFPlayer.play(001); 
-        delay(2000); // Wait for the audio to finish
-        state.audioPlaying = false;
-      }
-    }
+    // Return to ready state
+    displayMessage("Ready to weigh", "Step on scale");
   }
 }
 
@@ -1025,82 +935,4 @@ void calibrate() {
   
   displayMessage("Calibration done", "Factor saved", 2000);
   displayMessage("Ready to weigh", "Step on scale");
-}
-
-void setupWiFi() {
-  Serial.print("Connecting to ");
-  Serial.println(WIFI_SSID);
-  displayMessage("Connecting to", WIFI_SSID);
-  
-  // Enable WiFi in low power mode
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  // Configure power saving
-  esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-  
-  int connectionAttempts = 0;
-  while (WiFi.status() != WL_CONNECTED && connectionAttempts < 20) {
-    delay(500);
-    Serial.print(".");
-    connectionAttempts++;
-  }
-  
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi connected");
-    Serial.print("IP address: ");
-    Serial.println(WiFi.localIP());
-    
-    String ipMessage = "IP: " + WiFi.localIP().toString();
-    displayMessage("WiFi connected", ipMessage.c_str(), 1000);
-    
-    state.wifiConnected = true;
-    wifiLastConnectTime = millis();
-    
-    mqttClient.setServer(THINGSBOARD_SERVER, THINGSBOARD_PORT);
-  } else {
-    Serial.println("WiFi connection failed");
-    displayMessage("WiFi failed", "Check credentials", 2000);
-    state.wifiConnected = false;
-    disableWiFi(); // Turn off WiFi to save power
-  }
-}
-
-void reconnectMQTT() {
-  Serial.println("Connecting to ThingsBoard...");
-  
-  if (mqttClient.connect(MQTT_CLIENT_ID, THINGSBOARD_TOKEN, NULL)) {
-    Serial.println("ThingsBoard connected");
-  } else {
-    Serial.print("Failed, rc=");
-    Serial.println(mqttClient.state());
-  }
-}
-
-bool publishWeightToThingsBoard(float weight) {
-  // Connect WiFi if not connected
-  if (!state.wifiConnected) {
-    setupWiFi();
-  }
-
-  if (!state.wifiConnected) {
-    return false;
-  }
-
-  // Connect MQTT if needed
-  if (!mqttClient.connected()) {
-    reconnectMQTT();
-    if (!mqttClient.connected()) {
-      return false;
-    }
-  }
-  
-  // Prepare simple JSON payload with only weight
-  char payload[32]; 
-  snprintf(payload, sizeof(payload), "{\"weight\":%.1f}", weight);
-  
-  Serial.print("Publishing weight to ThingsBoard: ");
-  Serial.println(payload);
-  
-  return mqttClient.publish(TELEMETRY_TOPIC, payload);
 }
