@@ -467,8 +467,6 @@ void handleSerialCommands() {
           Serial.print("CPU frequency: ");
           Serial.print(getCpuFrequencyMhz());
           Serial.println(" MHz");
-          Serial.print("WiFi status: ");
-          Serial.println(state.wifiConnected ? "Connected" : "Disconnected");
           Serial.print("Display status: ");
           Serial.println(displaySleeping ? "Sleep" : "Active");
           Serial.print("Inactivity time: ");
